@@ -200,93 +200,57 @@ def median_kernel_tiled(
     out_idx,
     N,
     BLOCK_N: tl.constexpr,
+    N_ITERS: tl.constexpr,
 ):
-    """Tiled radix-select for N > 4096. Determines median's bits by counting
-    across tiles, then scans for the matching element."""
+    """Binary-search median for large N with configurable iterations."""
     pid = ext.program_id(0)
 
-    # Shared constants for float-to-uint conversion
-    one_u32 = tl.full([], value=1, dtype=tl.uint32)
-    sign_bit_const = one_u32 << 31
-    shift31 = tl.full([], value=31, dtype=tl.int32)
+    in_dtype = inp.dtype.element_ty
+    max_init = float("inf")
+    min_init = float("-inf")
+
+    lo = tl.full([], value=max_init, dtype=tl.float32)
+    hi = tl.full([], value=min_init, dtype=tl.float32)
+    for start in range(0, N, BLOCK_N):
+        n_offset = start + tl.arange(0, BLOCK_N)
+        tmask = n_offset < N
+        block_vals = tl.load(inp + pid * N + n_offset, mask=tmask, other=0)
+        f32 = block_vals.to(tl.float32)
+        lo = tl.minimum(lo, tl.min(tl.where(tmask, f32, max_init)))
+        hi = tl.maximum(hi, tl.max(tl.where(tmask, f32, min_init)))
 
     k = (N - 1) // 2
-    target_u32 = tl.zeros([], dtype=tl.uint32)
 
-    # Phase 1: determine median's uint32 value bit by bit
-    for bit in range(31, 11, -1):
-        count_zeros = tl.zeros([], dtype=tl.int32)
+    for _ in range(N_ITERS):
+        mid = (lo + hi) * 0.5
+        count_le = tl.zeros([], dtype=tl.int32)
         for start in range(0, N, BLOCK_N):
             n_offset = start + tl.arange(0, BLOCK_N)
             tmask = n_offset < N
             block_vals = tl.load(inp + pid * N + n_offset, mask=tmask, other=0)
             f32 = block_vals.to(tl.float32)
-            ui = f32.to(tl.uint32, bitcast=True)
-            si = f32.to(tl.int32, bitcast=True)
-            s_ext = (si >> shift31).to(tl.uint32, bitcast=True)
-            cm = sign_bit_const | s_ext
-            vu32 = ui ^ cm
+            count_le += tl.sum(tl.where(tmask, f32 <= mid, False).to(tl.int32), axis=0)
+        lo = tl.where(count_le <= k, mid, lo)
+        hi = tl.where(count_le <= k, hi, mid)
 
-            bit_val = (vu32 >> bit) & 1
-            zeros = tmask & (bit_val == 0)
-            count_zeros += tl.sum(zeros.to(tl.int32), axis=0)
-
-        keep_zeros = count_zeros > k
-        target_u32 = tl.where(keep_zeros, target_u32, target_u32 | (one_u32 << bit))
-        k = tl.where(keep_zeros, k, k - count_zeros)
-
-    # Phase 2: scan for element matching target_u32
-    exact_elem = tl.full([], value=0, dtype=inp.dtype.element_ty)
-    exact_idx = tl.full([], value=0, dtype=tl.int64)
-    exact_count = tl.zeros([], dtype=tl.int32)
+    # The k-th element is the smallest value strictly > lo.
+    # Scan for the minimum f32 among elements > lo.
+    best_val = tl.full([], value=max_init, dtype=tl.float32)
+    best_elem = tl.full([], value=0, dtype=in_dtype)
+    best_idx = tl.full([], value=0, dtype=tl.int64)
 
     for start in range(0, N, BLOCK_N):
         n_offset = start + tl.arange(0, BLOCK_N)
         tmask = n_offset < N
         block_vals = tl.load(inp + pid * N + n_offset, mask=tmask, other=0)
         f32 = block_vals.to(tl.float32)
-        ui = f32.to(tl.uint32, bitcast=True)
-        si = f32.to(tl.int32, bitcast=True)
-        s_ext = (si >> shift31).to(tl.uint32, bitcast=True)
-        cm = sign_bit_const | s_ext
-        vu32 = ui ^ cm
-
-        matches = tmask & (vu32 == target_u32)
-        n_matches = tl.sum(matches.to(tl.int32), axis=0)
-        match_positions = tl.where(matches, tl.arange(0, BLOCK_N), BLOCK_N + 1)
-        first_match = tl.min(match_positions, axis=0)
-
-        is_first = (exact_count == 0) & (n_matches > 0)
-        exact_elem = tl.where(
-            is_first,
-            tl.sum(
-                tl.where(
-                    tl.arange(0, BLOCK_N) == first_match,
-                    block_vals,
-                    tl.zeros([BLOCK_N], dtype=block_vals.dtype),
-                ),
-                axis=0,
-            ),
-            exact_elem,
-        )
-        exact_idx = tl.where(is_first, start + first_match, exact_idx).to(tl.int64)
-        exact_count += n_matches
-
-    # Fallback: find element with minimum absolute difference (used only if no exact match)
-    best_diff = tl.full([], value=float("inf"), dtype=tl.float32)
-    fallback_elem = tl.full([], value=0, dtype=inp.dtype.element_ty)
-    fallback_idx = tl.full([], value=0, dtype=tl.int64)
-
-    for start in range(0, N, BLOCK_N):
-        n_offset = start + tl.arange(0, BLOCK_N)
-        tmask = n_offset < N
-        block_vals = tl.load(inp + pid * N + n_offset, mask=tmask, other=0)
-        f32 = block_vals.to(tl.float32)
-        diff = tl.where(tmask, tl.abs(f32), float("inf"))
-        local_best = tl.min(diff, axis=0)
-        local_pos = tl.argmin(diff, axis=0)
-        update = local_best < best_diff
-        best_diff = tl.where(update, local_best, best_diff)
+        # Mask: valid elements >= lo (handle all-same edge case)
+        candidate_mask = tmask & (f32 >= lo)
+        candidate_vals = tl.where(candidate_mask, f32, max_init)
+        local_best_val = tl.min(candidate_vals, axis=0)
+        local_pos = tl.argmin(candidate_vals, axis=0)
+        update = local_best_val < best_val
+        best_val = tl.where(update, local_best_val, best_val)
         local_elem = tl.sum(
             tl.where(
                 tl.arange(0, BLOCK_N) == local_pos,
@@ -295,15 +259,11 @@ def median_kernel_tiled(
             ),
             axis=0,
         ).to(block_vals.dtype)
-        fallback_elem = tl.where(update, local_elem, fallback_elem)
-        fallback_idx = tl.where(update, start + local_pos, fallback_idx).to(tl.int64)
+        best_elem = tl.where(update, local_elem, best_elem)
+        best_idx = tl.where(update, start + local_pos, best_idx).to(tl.int64)
 
-    use_exact = exact_count > 0
-    final_elem = tl.where(use_exact, exact_elem, fallback_elem)
-    final_idx = tl.where(use_exact, exact_idx, fallback_idx)
-
-    tl.store(out_val + pid, final_elem)
-    tl.store(out_idx + pid, final_idx.to(tl.int64))
+    tl.store(out_val + pid, best_elem)
+    tl.store(out_idx + pid, best_idx.to(tl.int64))
 
 
 def _median_impl(inp_2d):
@@ -332,17 +292,36 @@ def _median_impl(inp_2d):
             else:
                 median_kernel[(M, 1, 1)](inp_2d, out_val, out_idx, N, block_n)
         else:
-            from flag_gems.ops.sort import sort_stable
+            if M == 1:
+                # Single row: sort is faster (multiple blocks, better GPU utilization)
+                from flag_gems.ops.sort import sort_stable
 
-            sorted_vals, sorted_indices = sort_stable(
-                inp_2d,
-                stable=True,
-                dim=-1,
-                descending=False,
-            )
-            k = (N - 1) // 2
-            out_val = sorted_vals[:, k].contiguous()
-            out_idx = sorted_indices[:, k].contiguous()
+                sorted_vals, sorted_indices = sort_stable(
+                    inp_2d,
+                    stable=True,
+                    dim=-1,
+                    descending=False,
+                )
+                k = (N - 1) // 2
+                out_val = sorted_vals[:, k].contiguous()
+                out_idx = sorted_indices[:, k].contiguous()
+            else:
+                block_n = min(triton.next_power_of_2(N), 4096)
+                # Per-dtype optimal: bf16 has 7-bit mantissa, needs fewest iters
+                if dtype == torch.bfloat16:
+                    n_iters = 10
+                elif dtype == torch.float16:
+                    n_iters = 13
+                else:
+                    n_iters = 14
+                median_kernel_tiled[(M, 1, 1)](
+                    inp_2d,
+                    out_val,
+                    out_idx,
+                    N,
+                    block_n,
+                    n_iters,
+                )
 
     return out_val, out_idx
 
