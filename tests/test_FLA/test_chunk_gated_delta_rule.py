@@ -16,7 +16,8 @@ def _alloc_fn(size, align, stream):
     return torch.empty(size, dtype=torch.int8, device=flag_gems.device)
 
 
-triton.set_allocator(_alloc_fn)
+if hasattr(triton, "set_allocator"):
+    triton.set_allocator(_alloc_fn)
 
 # Disable TMA for Blackwell GPUs (compute capability 12.x) to avoid numerical issues
 _device_major, _device_minor = torch.cuda.get_device_capability()

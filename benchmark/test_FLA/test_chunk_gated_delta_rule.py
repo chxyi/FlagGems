@@ -84,7 +84,8 @@ class ChunkGatedDeltaRuleBenchmark(Benchmark):
         def _alloc_fn(size, align, stream):
             return torch.empty(size, dtype=torch.int8, device=flag_gems.device)
 
-        triton.set_allocator(_alloc_fn)
+        if hasattr(triton, "set_allocator"):
+            triton.set_allocator(_alloc_fn)
 
     def set_more_shapes(self):
         """Provide additional sequence lengths for comprehensive benchmarking."""
