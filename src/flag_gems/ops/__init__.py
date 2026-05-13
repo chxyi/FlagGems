@@ -216,6 +216,7 @@ from flag_gems.ops.max_pool3d_with_indices import (
 )
 from flag_gems.ops.maximum import maximum
 from flag_gems.ops.mean import mean, mean_dim
+from flag_gems.ops.median import median, median_dim
 from flag_gems.ops.min import min, min_dim
 from flag_gems.ops.minimum import minimum
 from flag_gems.ops.mm import mm, mm_out
@@ -641,6 +642,8 @@ __all__ = [
     "masked_select",
     "max",
     "max_dim",
+    "median",
+    "median_dim",
     "max_pool2d_with_indices",
     "max_pool2d_backward",
     "max_pool3d_with_indices",

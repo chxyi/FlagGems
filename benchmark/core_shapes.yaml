@@ -270,6 +270,14 @@ GenericBenchmark4DOnly:
     - [4096, 4096,4,8]
     - [1024, 65536,4,8]
 
+median:
+  shapes:
+    - [64, 64]        # 4096 elements, dim=1 → 64 rows × 64 cols
+    - [1024, 1024]    # 1M elements, dim=1 → 1024 rows × 1024 cols
+    - [4096, 256]     # 1M elements, dim=1 → 4096 rows × 256 cols
+    - [64, 512, 128]  # 4M elements, dim=1 → rows × 512 cols
+  shape_desc: "(B), M, N"
+
 UnaryReductionBenchmark:
   shapes:
     - [1048576] # 1024 * 1024
